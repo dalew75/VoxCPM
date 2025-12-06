@@ -2,3 +2,12 @@ launch.json
 __pycache__
 voxcpm.egg-info
 .DS_Store
+
+venv
+
+audio/output
+audio/input-temp
+
+audio/*.wav
+*.ogg
+*.mp3
