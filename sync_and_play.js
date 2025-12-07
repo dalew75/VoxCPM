@@ -123,6 +123,74 @@ function syncFiles() {
     });
 }
 
+// Combine all WAV files into one file
+async function combineWavFiles() {
+    return new Promise((resolve, reject) => {
+        const files = getWavFiles();
+        
+        if (files.length === 0) {
+            console.log('No WAV files to combine.');
+            resolve();
+            return;
+        }
+        
+        console.log(`\nCombining ${files.length} WAV files into combined.wav...`);
+        
+        // Create list file with sorted filenames (use absolute paths for reliability)
+        const listPath = path.join(LOCAL_DIR, 'list.txt');
+        const listContent = files.map(file => {
+            const absolutePath = path.join(LOCAL_DIR, file);
+            return `file '${absolutePath}'`;
+        }).join('\n') + '\n';
+        
+        try {
+            fs.writeFileSync(listPath, listContent, 'utf8');
+        } catch (err) {
+            reject(new Error(`Failed to create list file: ${err.message}`));
+            return;
+        }
+        
+        // Use ffmpeg to combine files
+        const outputPath = path.join(LOCAL_DIR, 'combined.wav');
+        const ffmpeg = spawn('ffmpeg', [
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', listPath,
+            '-c', 'copy',
+            '-y', // Overwrite output file if it exists
+            outputPath
+        ], {
+            cwd: LOCAL_DIR // Run from the local directory
+        });
+        
+        let stderr = '';
+        
+        ffmpeg.stderr.on('data', (data) => {
+            stderr += data.toString();
+        });
+        
+        ffmpeg.on('close', (code) => {
+            // Clean up list file
+            try {
+                fs.unlinkSync(listPath);
+            } catch (err) {
+                // Ignore cleanup errors
+            }
+            
+            if (code === 0) {
+                console.log(`Successfully created: ${outputPath}`);
+                resolve();
+            } else {
+                reject(new Error(`ffmpeg exited with code ${code}: ${stderr}`));
+            }
+        });
+        
+        ffmpeg.on('error', (err) => {
+            reject(new Error(`ffmpeg spawn error: ${err.message}`));
+        });
+    });
+}
+
 // Process and play files
 async function processFiles() {
     const files = getWavFiles();
@@ -142,8 +210,18 @@ async function processFiles() {
     // If no unplayed files and we're not currently playing, check for idle
     if (unplayedFiles.length === 0 && !isPlaying) {
         if (!idleTimer) {
-            idleTimer = setTimeout(() => {
-                console.log('\nNo new files detected. All files have been played. Exiting...');
+            idleTimer = setTimeout(async () => {
+                console.log('\nNo new files detected. All files have been played.');
+                console.log('Combining all WAV files...');
+                
+                // Combine all WAV files before exiting
+                try {
+                    //await combineWavFiles();
+                } catch (err) {
+                    console.error(`Error combining files: ${err.message}`);
+                }
+                
+                console.log('Exiting...');
                 if (rsyncProcess) {
                     rsyncProcess.kill();
                 }
