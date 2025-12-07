@@ -7,7 +7,7 @@ const path = require('path');
 // Configuration
 const REMOTE_HOST = 'root@147.182.151.133';
 const REMOTE_PATH = '/root/VoxCPM/audio/output/';
-const LOCAL_DIR = './';
+const LOCAL_DIR = './audio_synced'; // Use dedicated directory for safety
 const RSYNC_INTERVAL = 2000; // Sync every 2 seconds
 const IDLE_TIMEOUT = 5000; // Exit if no new files for 5 seconds
 
@@ -64,12 +64,14 @@ function playFile(filename) {
     });
 }
 
-// Sync files from remote
+// Sync files from remote (ONLY .wav files, NO delete)
 function syncFiles() {
     return new Promise((resolve, reject) => {
+        // Only sync .wav files, exclude everything else for safety
         const rsync = spawn('rsync', [
             '-avz',
-            '--delete', // Remove files that no longer exist on remote
+            '--include', '*.wav',
+            '--exclude', '*',
             `${REMOTE_HOST}:${REMOTE_PATH}`,
             LOCAL_DIR
         ]);
@@ -157,12 +159,17 @@ async function processFiles() {
 // Main loop
 async function main() {
     console.log('Starting sync and play...');
-    console.error('This function is dangerous. Aborting further processing.');
-    process.exit(1);
     console.log(`Remote: ${REMOTE_HOST}:${REMOTE_PATH}`);
     console.log(`Local: ${LOCAL_DIR}`);
     console.log(`Sync interval: ${RSYNC_INTERVAL}ms`);
-    console.log(`Idle timeout: ${IDLE_TIMEOUT}ms\n`);
+    console.log(`Idle timeout: ${IDLE_TIMEOUT}ms`);
+    console.log('Safety: Only syncing .wav files, no delete operations\n');
+    
+    // Ensure local directory exists
+    if (!fs.existsSync(LOCAL_DIR)) {
+        fs.mkdirSync(LOCAL_DIR, { recursive: true });
+        console.log(`Created local directory: ${LOCAL_DIR}\n`);
+    }
     
     // Initial sync
     try {
