@@ -8,8 +8,8 @@ const path = require('path');
 const REMOTE_HOST = 'root@147.182.151.133';
 const REMOTE_PATH = '/root/VoxCPM/audio/output/';
 const LOCAL_DIR = './audio_synced'; // Use dedicated directory for safety
-const RSYNC_INTERVAL = 5000; // Sync every 5 seconds (less aggressive)
-const IDLE_TIMEOUT = 10000; // Exit if no new files for 10 seconds
+const RSYNC_INTERVAL = 10000; // Sync every 5 seconds (less aggressive)
+const IDLE_TIMEOUT = 30000; // Exit if no new files for 10 seconds
 const MAX_SYNC_RETRIES = 3; // Max retries for failed syncs
 
 // State tracking
