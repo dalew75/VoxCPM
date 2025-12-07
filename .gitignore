@@ -7,6 +7,7 @@ venv
 
 audio/output
 audio/input-temp
+audio_synced
 
 audio/*.wav
 *.ogg
