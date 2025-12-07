@@ -79,6 +79,9 @@ def process_prompt(prompt, idx, total_prompts, reply_subject=None, nats_client=N
                 if not os.path.exists(speaker_txt):
                     missing_files.append("TXT")
                 print(f"Warning: Missing {', '.join(missing_files)} file(s) for speaker '{speaker_name}'. Voice cloning disabled for this prompt.")
+fix                # Explicitly set both to None to ensure they're not used
+                prompt_wav_path = None
+                prompt_text = None
     
     # Truncate prompt if maxchars or maxsentences is provided
     if args.maxchars is not None:
@@ -90,19 +93,25 @@ def process_prompt(prompt, idx, total_prompts, reply_subject=None, nats_client=N
     timestamp_ms = int(time.time() * 1000)
     output_filename = f"{timestamp_ms}.wav"
     
+    # Prepare generation arguments - only include voice cloning params if both are set
+    generate_kwargs = {
+        'text': text_to_process,
+        'cfg_value': 2.0,             # LM guidance on LocDiT, higher for better adherence to the prompt, but maybe worse
+        'inference_timesteps': 10,   # LocDiT inference timesteps, higher for better result, lower for fast speed
+        'normalize': True,           # enable external TN tool
+        'denoise': True,             # enable external Denoise tool
+        'retry_badcase': True,        # enable retrying mode for some bad cases (unstoppable)
+        'retry_badcase_max_times': 3,  # maximum retrying times
+        'retry_badcase_ratio_threshold': 6.0, # maximum length restriction for bad case detection (simple but effective), it could be adjusted for slow pace speech
+    }
+    
+    # Only add voice cloning parameters if both are provided
+    if prompt_wav_path is not None and prompt_text is not None:
+        generate_kwargs['prompt_wav_path'] = prompt_wav_path
+        generate_kwargs['prompt_text'] = prompt_text
+    
     # Non-streaming
-    wav = model.generate(
-        text=text_to_process,
-        prompt_wav_path=prompt_wav_path,      # optional: path to a prompt speech for voice cloning
-        prompt_text=prompt_text,          # optional: reference text
-        cfg_value=2.0,             # LM guidance on LocDiT, higher for better adherence to the prompt, but maybe worse
-        inference_timesteps=10,   # LocDiT inference timesteps, higher for better result, lower for fast speed
-        normalize=True,           # enable external TN tool
-        denoise=True,             # enable external Denoise tool
-        retry_badcase=True,        # enable retrying mode for some bad cases (unstoppable)
-        retry_badcase_max_times=3,  # maximum retrying times
-        retry_badcase_ratio_threshold=6.0, # maximum length restriction for bad case detection (simple but effective), it could be adjusted for slow pace speech
-    )
+    wav = model.generate(**generate_kwargs)
 
     full_output_path = os.path.join(output_dir, output_filename)
     sf.write(full_output_path, wav, 16000)
