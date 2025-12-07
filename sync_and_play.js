@@ -8,8 +8,9 @@ const path = require('path');
 const REMOTE_HOST = 'root@147.182.151.133';
 const REMOTE_PATH = '/root/VoxCPM/audio/output/';
 const LOCAL_DIR = './audio_synced'; // Use dedicated directory for safety
-const RSYNC_INTERVAL = 2000; // Sync every 2 seconds
-const IDLE_TIMEOUT = 5000; // Exit if no new files for 5 seconds
+const RSYNC_INTERVAL = 5000; // Sync every 5 seconds (less aggressive)
+const IDLE_TIMEOUT = 10000; // Exit if no new files for 10 seconds
+const MAX_SYNC_RETRIES = 3; // Max retries for failed syncs
 
 // State tracking
 const playedFiles = new Set();
@@ -72,6 +73,7 @@ function syncFiles() {
             '-avz',
             '--include', '*.wav',
             '--exclude', '*',
+            '--timeout=10', // 10 second timeout for connections
             `${REMOTE_HOST}:${REMOTE_PATH}`,
             LOCAL_DIR
         ]);
@@ -91,18 +93,31 @@ function syncFiles() {
             if (code === 0) {
                 resolve();
             } else {
-                // rsync can exit with non-zero codes for various reasons
-                // We'll treat it as success unless it's a critical error
-                if (code === 23 || code === 24) {
+                // Check if it's a connection error (non-critical)
+                const isConnectionError = stderr.includes('Connection refused') || 
+                                         stderr.includes('Connection timed out') ||
+                                         stderr.includes('Network is unreachable') ||
+                                         code === 255; // SSH connection error
+                
+                if (isConnectionError) {
+                    // Connection errors are non-fatal - just log and resolve
+                    // The next sync attempt will try again
+                    console.warn(`Sync connection issue (will retry): ${stderr.trim() || `code ${code}`}`);
+                    resolve(); // Resolve instead of reject to continue operation
+                } else if (code === 23 || code === 24) {
                     // Partial transfer or vanished source files - not critical
                     resolve();
                 } else {
-                    reject(new Error(`rsync exited with code ${code}: ${stderr}`));
+                    // Other errors - still resolve to keep going, but log
+                    console.warn(`Sync warning (code ${code}): ${stderr.trim() || 'unknown error'}`);
+                    resolve();
                 }
             }
         });
         
         rsync.on('error', (err) => {
+            // Spawn errors (like command not found) are more serious
+            console.error(`Sync spawn error: ${err.message}`);
             reject(err);
         });
     });
@@ -185,7 +200,9 @@ async function main() {
         try {
             await syncFiles();
         } catch (err) {
-            console.error(`Sync error: ${err.message}`);
+            // Only log critical errors (spawn failures, etc.)
+            // Connection errors are already handled in syncFiles()
+            console.error(`Sync critical error: ${err.message}`);
         }
     }, RSYNC_INTERVAL);
     
