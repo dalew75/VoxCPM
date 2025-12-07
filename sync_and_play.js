@@ -3,6 +3,7 @@
 const { spawn, exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { connect, StringCodec } = require('nats');
 
 // Configuration
 const REMOTE_HOST = 'root@147.182.151.133';
@@ -12,12 +13,19 @@ const RSYNC_INTERVAL = 10000; // Sync every 5 seconds (less aggressive)
 const IDLE_TIMEOUT = 30000; // Exit if no new files for 10 seconds
 const MAX_SYNC_RETRIES = 3; // Max retries for failed syncs
 
+// NATS configuration
+const NATS_SERVER = process.env.NATS_SERVER || 'nats://localhost:4222';
+const NATS_SUBJECT = process.env.NATS_SUBJECT || 'voxcpm.files'; // Subject to listen for file notifications
+
 // State tracking
 const playedFiles = new Set();
+const playQueue = []; // Queue of files to play (in order)
 let rsyncProcess = null;
 let isPlaying = false;
 let lastFileCount = 0;
 let idleTimer = null;
+let natsClient = null;
+const sc = StringCodec();
 
 // Get all WAV files in directory, sorted by filename (timestamp order)
 function getWavFiles() {
@@ -193,8 +201,33 @@ async function combineWavFiles() {
 
 // Process and play files
 async function processFiles() {
+    // First, check if there's a file in the play queue that's ready to play
+    if (playQueue.length > 0 && !isPlaying) {
+        const queuedFile = playQueue[0];
+        const filePath = path.join(LOCAL_DIR, queuedFile);
+        
+        // Check if the file exists locally
+        if (fs.existsSync(filePath)) {
+            // Remove from queue and play
+            playQueue.shift();
+            isPlaying = true;
+            
+            try {
+                await playFile(queuedFile);
+                playedFiles.add(queuedFile);
+            } catch (err) {
+                console.error(`Error playing ${queuedFile}: ${err.message}`);
+                playedFiles.add(queuedFile);
+            } finally {
+                isPlaying = false;
+            }
+            return;
+        }
+        // File not ready yet, wait for sync
+    }
+    
     const files = getWavFiles();
-    const unplayedFiles = files.filter(file => !playedFiles.has(file));
+    const unplayedFiles = files.filter(file => !playedFiles.has(file) && !playQueue.includes(file));
     
     // Update file count for idle detection
     const currentFileCount = files.length;
@@ -207,8 +240,8 @@ async function processFiles() {
         }
     }
     
-    // If no unplayed files and we're not currently playing, check for idle
-    if (unplayedFiles.length === 0 && !isPlaying) {
+    // If no unplayed files and queue is empty and we're not currently playing, check for idle
+    if (unplayedFiles.length === 0 && playQueue.length === 0 && !isPlaying) {
         if (!idleTimer) {
             idleTimer = setTimeout(async () => {
                 console.log('\nNo new files detected. All files have been played.');
@@ -225,13 +258,16 @@ async function processFiles() {
                 if (rsyncProcess) {
                     rsyncProcess.kill();
                 }
+                if (natsClient) {
+                    await natsClient.close();
+                }
                 process.exit(0);
             }, IDLE_TIMEOUT);
         }
         return;
     }
     
-    // Play the next unplayed file
+    // Play the next unplayed file (if not in queue)
     if (unplayedFiles.length > 0 && !isPlaying) {
         const nextFile = unplayedFiles[0];
         isPlaying = true;
@@ -256,7 +292,49 @@ async function main() {
     console.log(`Local: ${LOCAL_DIR}`);
     console.log(`Sync interval: ${RSYNC_INTERVAL}ms`);
     console.log(`Idle timeout: ${IDLE_TIMEOUT}ms`);
-    console.log('Safety: Only syncing .wav files, no delete operations\n');
+    console.log('Safety: Only syncing .wav files, no delete operations');
+    
+    // Connect to NATS
+    try {
+        console.log(`Connecting to NATS: ${NATS_SERVER}`);
+        natsClient = await connect({ servers: NATS_SERVER });
+        console.log('Connected to NATS!');
+        
+        // Subscribe to file notifications
+        const sub = natsClient.subscribe(NATS_SUBJECT);
+        console.log(`Subscribed to: ${NATS_SUBJECT}\n`);
+        
+        // Handle NATS messages
+        (async () => {
+            for await (const msg of sub) {
+                try {
+                    const data = JSON.parse(sc.decode(msg.data));
+                    const filename = data.filename;
+                    
+                    if (filename && filename.endsWith('.wav')) {
+                        // Add to play queue if not already played or queued
+                        if (!playedFiles.has(filename) && !playQueue.includes(filename)) {
+                            playQueue.push(filename);
+                            console.log(`Added to play queue: ${filename} (queue size: ${playQueue.length})`);
+                            
+                            // Reset idle timer when new file is queued
+                            if (idleTimer) {
+                                clearTimeout(idleTimer);
+                                idleTimer = null;
+                            }
+                        }
+                    }
+                } catch (err) {
+                    console.error(`Error processing NATS message: ${err.message}`);
+                }
+            }
+        })().catch(err => {
+            console.error(`NATS subscription error: ${err.message}`);
+        });
+    } catch (err) {
+        console.warn(`NATS connection failed: ${err.message}`);
+        console.warn('Continuing without NATS notifications...\n');
+    }
     
     // Ensure local directory exists
     if (!fs.existsSync(LOCAL_DIR)) {
@@ -290,12 +368,15 @@ async function main() {
     }, 500); // Check every 500ms for new files to play
     
     // Handle cleanup on exit
-    process.on('SIGINT', () => {
+    process.on('SIGINT', async () => {
         console.log('\nInterrupted. Cleaning up...');
         clearInterval(syncInterval);
         clearInterval(processInterval);
         if (idleTimer) {
             clearTimeout(idleTimer);
+        }
+        if (natsClient) {
+            await natsClient.close();
         }
         process.exit(0);
     });
