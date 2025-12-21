@@ -182,9 +182,18 @@ async def subscription_mode():
             if not reply_subject:
                 print("Warning: No reply_subject provided, skipping NATS notifications")
             
-            print(f"\nReceived request (label: {label}, messages: {len(messages)})")
-            
             total = len(messages)
+            
+            # Log message count and first/last messages
+            print(f"\nReceived request (label: {label}, messages: {total})")
+            if total > 0:
+                print(f"  First message: {messages[0][:100]}{'...' if len(messages[0]) > 100 else ''}")
+                if total > 1:
+                    print(f"  Last message: {messages[-1][:100]}{'...' if len(messages[-1]) > 100 else ''}")
+                elif total == 1:
+                    print(f"  (Only one message)")
+            
+            print(f"Processing {total} message(s)...")
             for idx, prompt in enumerate(messages, start=1):
                 # Process synchronously (model.generate is blocking anyway)
                 process_prompt(prompt, idx, total, reply_subject, nc)
