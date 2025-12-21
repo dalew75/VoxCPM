@@ -70,7 +70,24 @@ def process_prompt(prompt, idx, total_prompts, reply_subject=None, nats_client=N
             if os.path.exists(speaker_wav) and os.path.exists(speaker_txt):
                 prompt_wav_path = speaker_wav
                 with open(speaker_txt, 'r', encoding='utf-8') as f:
-                    prompt_text = f.read().strip()
+                    # Read the file - use only the last non-empty line
+                    # The prompt_text should be the exact transcript of the WAV file
+                    # Using only the last line prevents prepending unwanted text from earlier recordings
+                    lines = [line.strip() for line in f.readlines() if line.strip()]
+                    if lines:
+                        # Use the last line (most recent recording)
+                        # Clean the prompt_text: remove all trailing/leading whitespace
+                        # The prompt_text should match the WAV transcript exactly
+                        # Any extra content could leak into the generated output
+                        prompt_text = lines[-1].strip()
+                        # Normalize whitespace: replace multiple spaces with single space
+                        prompt_text = ' '.join(prompt_text.split())
+                    else:
+                        # Fallback: read entire file if no line breaks
+                        f.seek(0)
+                        prompt_text = f.read().strip()
+                        # Normalize whitespace for fallback case too
+                        prompt_text = ' '.join(prompt_text.split())
             else:
                 # If either file is missing, warn and don't use voice cloning for this prompt
                 missing_files = []
@@ -79,7 +96,7 @@ def process_prompt(prompt, idx, total_prompts, reply_subject=None, nats_client=N
                 if not os.path.exists(speaker_txt):
                     missing_files.append("TXT")
                 print(f"Warning: Missing {', '.join(missing_files)} file(s) for speaker '{speaker_name}'. Voice cloning disabled for this prompt.")
-fix                # Explicitly set both to None to ensure they're not used
+                # Explicitly set both to None to ensure they're not used
                 prompt_wav_path = None
                 prompt_text = None
     

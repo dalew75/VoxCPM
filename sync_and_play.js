@@ -6,10 +6,10 @@ const path = require('path');
 const { connect, StringCodec } = require('nats');
 
 // Configuration
-const REMOTE_HOST = 'root@147.182.151.133';
+const REMOTE_HOST = 'root@134.122.40.36';
 const REMOTE_PATH = '/root/VoxCPM/audio/output/';
 const LOCAL_DIR = './audio_synced'; // Use dedicated directory for safety
-const RSYNC_INTERVAL = 30000; // Sync every 5 seconds (less aggressive)
+const RSYNC_INTERVAL = parseInt(process.env.RSYNC_INTERVAL || '0', 10); // Sync interval in ms (0 = NATS-only mode)
 const IDLE_TIMEOUT = 30000; // Exit if no new files for 10 seconds
 const MAX_SYNC_RETRIES = 3; // Max retries for failed syncs
 
@@ -312,6 +312,16 @@ async function main() {
                     const filename = data.filename;
                     
                     if (filename && filename.endsWith('.wav')) {
+                        // If RSYNC_INTERVAL is 0, trigger a sync when we get a NATS notification
+                        if (RSYNC_INTERVAL === 0) {
+                            console.log(`NATS notification received, syncing for: ${filename}`);
+                            try {
+                                await syncFiles();
+                            } catch (err) {
+                                console.error(`Sync error for ${filename}: ${err.message}`);
+                            }
+                        }
+                        
                         // Add to play queue if not already played or queued
                         if (!playedFiles.has(filename) && !playQueue.includes(filename)) {
                             playQueue.push(filename);
@@ -342,25 +352,32 @@ async function main() {
         console.log(`Created local directory: ${LOCAL_DIR}\n`);
     }
     
-    // Initial sync
-    try {
-        await syncFiles();
-        console.log('Initial sync complete.\n');
-    } catch (err) {
-        console.error(`Initial sync failed: ${err.message}`);
-        process.exit(1);
-    }
-    
-    // Start continuous sync and play loop
-    const syncInterval = setInterval(async () => {
+    // Initial sync (only if not in NATS-only mode)
+    if (RSYNC_INTERVAL > 0) {
         try {
             await syncFiles();
+            console.log('Initial sync complete.\n');
         } catch (err) {
-            // Only log critical errors (spawn failures, etc.)
-            // Connection errors are already handled in syncFiles()
-            console.error(`Sync critical error: ${err.message}`);
+            console.error(`Initial sync failed: ${err.message}`);
+            process.exit(1);
         }
-    }, RSYNC_INTERVAL);
+    } else {
+        console.log('NATS-only mode: No periodic syncing, will sync on NATS notifications only.\n');
+    }
+    
+    // Start continuous sync and play loop (only if RSYNC_INTERVAL > 0)
+    let syncInterval = null;
+    if (RSYNC_INTERVAL > 0) {
+        syncInterval = setInterval(async () => {
+            try {
+                await syncFiles();
+            } catch (err) {
+                // Only log critical errors (spawn failures, etc.)
+                // Connection errors are already handled in syncFiles()
+                console.error(`Sync critical error: ${err.message}`);
+            }
+        }, RSYNC_INTERVAL);
+    }
     
     // Process files more frequently than sync
     const processInterval = setInterval(async () => {
@@ -370,7 +387,9 @@ async function main() {
     // Handle cleanup on exit
     process.on('SIGINT', async () => {
         console.log('\nInterrupted. Cleaning up...');
-        clearInterval(syncInterval);
+        if (syncInterval) {
+            clearInterval(syncInterval);
+        }
         clearInterval(processInterval);
         if (idleTimer) {
             clearTimeout(idleTimer);
