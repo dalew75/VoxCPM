@@ -7,7 +7,7 @@ const { connect, StringCodec } = require('nats');
 
 // Configuration
 const REMOTE_HOST = 'root@134.122.40.36';
-const REMOTE_PATH = '/root/VoxCPM/audio/output/';
+const REMOTE_PATH = '/root/VoxCPM-latest/audio/output/';
 const LOCAL_DIR = './audio_synced';
 const IDLE_TIMEOUT = 900000; // Exit if no new files for 30 seconds
 
