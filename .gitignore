@@ -3,6 +3,8 @@ __pycache__
 voxcpm.egg-info
 .DS_Store
 
+.env
+
 venv
 
 audio/output
@@ -12,3 +14,5 @@ audio_synced
 audio/*.wav
 *.ogg
 *.mp3
+
+new
