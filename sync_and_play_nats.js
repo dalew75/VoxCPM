@@ -3,6 +3,7 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { connect, StringCodec } = require('nats');
 
 // Configuration
@@ -19,52 +20,111 @@ const NATS_SUBJECT = process.env.NATS_SUBJECT || 'voxcpm.files';
 const playedFiles = new Set();
 const playQueue = []; // Queue of files to play (in order)
 let isPlaying = false;
+let isSyncing = false; // Track if a sync is in progress
+let lastSyncTime = 0; // Track when last sync completed
 let idleTimer = null;
 let natsClient = null;
 const sc = StringCodec();
 
-// Sync a specific file from remote using scp
-function syncFile(filename) {
+// Sync configuration
+const SYNC_DELAY = 1000; // Minimum delay between syncs (1 second)
+const MAX_SYNC_RETRIES = 3;
+const RETRY_DELAY = 2000; // 2 seconds between retries
+
+// SSH ControlMaster socket path for connection reuse
+const SSH_CONTROL_DIR = path.join(os.tmpdir(), 'voxcpm-ssh');
+const SSH_CONTROL_PATH = path.join(SSH_CONTROL_DIR, `control-${REMOTE_HOST.replace(/[@:]/g, '_')}`);
+
+// Ensure SSH control directory exists
+function ensureSSHControlDir() {
+    if (!fs.existsSync(SSH_CONTROL_DIR)) {
+        fs.mkdirSync(SSH_CONTROL_DIR, { recursive: true, mode: 0o700 });
+    }
+}
+
+// Sync a single file from remote using scp with connection reuse
+function syncFile(filename, retryCount = 0) {
     return new Promise((resolve, reject) => {
+        // Ensure control directory exists
+        ensureSSHControlDir();
+        
         const remoteFile = `${REMOTE_HOST}:${REMOTE_PATH}${filename}`;
         const localFile = path.join(LOCAL_DIR, filename);
         
-        const scp = spawn('scp', [
-            '-o', 'ConnectTimeout=10',
-            '-o', 'StrictHostKeyChecking=no',
-            '-q', // Quiet mode (suppress progress)
-            remoteFile,
-            localFile
-        ]);
+        // Add delay if syncing too quickly after last sync
+        const timeSinceLastSync = Date.now() - lastSyncTime;
+        const delayNeeded = Math.max(0, SYNC_DELAY - timeSinceLastSync);
         
-        let stderr = '';
-        
-        scp.stderr.on('data', (data) => {
-            stderr += data.toString();
-        });
-        
-        scp.on('close', (code) => {
-            if (code === 0) {
-                resolve();
-            } else {
-                const isConnectionError = stderr.includes('Connection refused') || 
-                                         stderr.includes('Connection timed out') ||
-                                         stderr.includes('Network is unreachable') ||
-                                         stderr.includes('Connection closed') ||
-                                         code === 255;
-                
-                if (isConnectionError) {
-                    console.warn(`SCP connection issue for ${filename} (will retry): ${stderr.trim() || `code ${code}`}`);
-                    reject(new Error(`Connection error: ${stderr.trim()}`));
+        const doSync = () => {
+            const scp = spawn('scp', [
+                '-o', 'ConnectTimeout=15',
+                '-o', 'StrictHostKeyChecking=no',
+                '-o', 'ServerAliveInterval=10',
+                '-o', 'ServerAliveCountMax=3',
+                '-o', `ControlMaster=auto`,
+                '-o', `ControlPath=${SSH_CONTROL_PATH}`,
+                '-o', 'ControlPersist=300', // Keep connection alive for 5 minutes
+                '-q', // Quiet mode (suppress progress)
+                remoteFile,
+                localFile
+            ]);
+            
+            let stderr = '';
+            
+            scp.stderr.on('data', (data) => {
+                stderr += data.toString();
+            });
+            
+            scp.on('close', (code) => {
+                if (code === 0) {
+                    lastSyncTime = Date.now();
+                    console.log(`Successfully synced: ${filename}`);
+                    resolve();
                 } else {
-                    reject(new Error(`scp exited with code ${code}: ${stderr.trim()}`));
+                    const isConnectionError = stderr.includes('Connection refused') || 
+                                             stderr.includes('Connection timed out') ||
+                                             stderr.includes('Network is unreachable') ||
+                                             stderr.includes('Connection closed') ||
+                                             stderr.includes('Connection reset') ||
+                                             code === 255;
+                    
+                    if (isConnectionError && retryCount < MAX_SYNC_RETRIES) {
+                        // Retry with exponential backoff
+                        const retryDelay = RETRY_DELAY * Math.pow(2, retryCount);
+                        console.warn(`SCP connection error for ${filename} (retry ${retryCount + 1}/${MAX_SYNC_RETRIES} in ${retryDelay}ms): ${stderr.trim() || `code ${code}`}`);
+                        
+                        setTimeout(() => {
+                            syncFile(filename, retryCount + 1)
+                                .then(resolve)
+                                .catch(reject);
+                        }, retryDelay);
+                    } else {
+                        reject(new Error(`scp exited with code ${code}: ${stderr.trim()}`));
+                    }
                 }
-            }
-        });
+            });
+            
+            scp.on('error', (err) => {
+                if (retryCount < MAX_SYNC_RETRIES) {
+                    const retryDelay = RETRY_DELAY * Math.pow(2, retryCount);
+                    console.warn(`SCP spawn error for ${filename} (retry ${retryCount + 1}/${MAX_SYNC_RETRIES} in ${retryDelay}ms): ${err.message}`);
+                    
+                    setTimeout(() => {
+                        syncFile(filename, retryCount + 1)
+                            .then(resolve)
+                            .catch(reject);
+                    }, retryDelay);
+                } else {
+                    reject(err);
+                }
+            });
+        };
         
-        scp.on('error', (err) => {
-            reject(err);
-        });
+        if (delayNeeded > 0) {
+            setTimeout(doSync, delayNeeded);
+        } else {
+            doSync();
+        }
     });
 }
 
@@ -101,10 +161,10 @@ function playFile(filename) {
     });
 }
 
-// Process and play files from queue
+// Process and play files from queue - sequential: play -> sync next -> play next
 async function processQueue() {
     // If queue is empty and not playing, check for idle
-    if (playQueue.length === 0 && !isPlaying) {
+    if (playQueue.length === 0 && !isPlaying && !isSyncing) {
         if (!idleTimer) {
             idleTimer = setTimeout(() => {
                 console.log('\nNo new files detected. All files have been played. Exiting...');
@@ -117,37 +177,64 @@ async function processQueue() {
         return;
     }
     
-    // Play the next file in queue if available and not currently playing
-    if (playQueue.length > 0 && !isPlaying) {
-        const nextFile = playQueue[0];
-        const filePath = path.join(LOCAL_DIR, nextFile);
+    // If we're already playing or syncing, wait
+    if (isPlaying || isSyncing) {
+        return;
+    }
+    
+    // If queue is empty, nothing to do
+    if (playQueue.length === 0) {
+        return;
+    }
+    
+    const nextFile = playQueue[0];
+    const filePath = path.join(LOCAL_DIR, nextFile);
+    
+    // Check if file exists locally
+    if (fs.existsSync(filePath)) {
+        // File exists, remove from queue and play
+        playQueue.shift();
+        isPlaying = true;
         
-        // Check if file exists locally
-        if (fs.existsSync(filePath)) {
-            // Remove from queue and play
-            playQueue.shift();
-            isPlaying = true;
+        try {
+            await playFile(nextFile);
+            playedFiles.add(nextFile);
+        } catch (err) {
+            console.error(`Error playing ${nextFile}: ${err.message}`);
+            playedFiles.add(nextFile);
+        } finally {
+            isPlaying = false;
             
-            try {
-                await playFile(nextFile);
-                playedFiles.add(nextFile);
-            } catch (err) {
-                console.error(`Error playing ${nextFile}: ${err.message}`);
-                playedFiles.add(nextFile);
-            } finally {
-                isPlaying = false;
+            // After playing, check if there's a next file to sync
+            if (playQueue.length > 0) {
+                const nextNextFile = playQueue[0];
+                const nextNextFilePath = path.join(LOCAL_DIR, nextNextFile);
+                
+                // If next file doesn't exist, sync it
+                if (!fs.existsSync(nextNextFilePath)) {
+                    isSyncing = true;
+                    try {
+                        await syncFile(nextNextFile);
+                    } catch (err) {
+                        console.error(`Failed to sync ${nextNextFile}: ${err.message}`);
+                        // Will retry on next cycle
+                    } finally {
+                        isSyncing = false;
+                    }
+                }
             }
-        } else {
-            // File doesn't exist yet, try to sync it
-            console.log(`File ${nextFile} not found locally, attempting to sync...`);
-            try {
-                await syncFile(nextFile);
-                console.log(`Successfully synced: ${nextFile}`);
-            } catch (err) {
-                console.error(`Failed to sync ${nextFile}: ${err.message}`);
-                // Remove from queue if sync fails after a few retries
-                // For now, just log and let it retry on next cycle
-            }
+        }
+    } else {
+        // File doesn't exist, sync it first
+        isSyncing = true;
+        try {
+            await syncFile(nextFile);
+            // After sync completes, the next cycle will play it
+        } catch (err) {
+            console.error(`Failed to sync ${nextFile}: ${err.message}`);
+            // Will retry on next cycle
+        } finally {
+            isSyncing = false;
         }
     }
 }
@@ -164,8 +251,12 @@ async function main() {
     // Ensure local directory exists
     if (!fs.existsSync(LOCAL_DIR)) {
         fs.mkdirSync(LOCAL_DIR, { recursive: true });
-        console.log(`Created local directory: ${LOCAL_DIR}\n`);
+        console.log(`Created local directory: ${LOCAL_DIR}`);
     }
+    
+    // Ensure SSH control directory exists for connection reuse
+    ensureSSHControlDir();
+    console.log(`SSH control path: ${SSH_CONTROL_PATH}\n`);
     
     // Connect to NATS
     try {
@@ -208,15 +299,10 @@ async function main() {
                             idleTimer = null;
                         }
                         
-                        // Try to sync the file immediately
-                        const filePath = path.join(LOCAL_DIR, filename);
-                        if (!fs.existsSync(filePath)) {
-                            console.log(`Syncing ${filename}...`);
-                            syncFile(filename).then(() => {
-                                console.log(`Successfully synced: ${filename}`);
-                            }).catch(err => {
-                                console.error(`Failed to sync ${filename}: ${err.message}`);
-                            });
+                        // If this is the first file in queue and we're not playing/syncing, start processing
+                        if (playQueue.length === 1 && !isPlaying && !isSyncing) {
+                            // Trigger processing immediately
+                            setImmediate(() => processQueue());
                         }
                     }
                 } catch (err) {
@@ -231,7 +317,7 @@ async function main() {
         process.exit(1);
     }
     
-    // Process queue periodically
+    // Process play queue periodically
     const processInterval = setInterval(async () => {
         await processQueue();
     }, 500); // Check every 500ms
